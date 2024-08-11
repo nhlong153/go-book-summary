@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -23,11 +23,13 @@ type result struct {
 }
 
 func main() {
-	var wg sync.WaitGroup
 
-	filePath := os.Args[1]
+	apiKey := flag.String("t", "", "token")
+	filePath := flag.String("fP", "", "Path to text file")
+	maxConcurrent := flag.Int("mC", 5, "Max concurrency at a time. Default is 5")
 
-	fileContent, err := readFileContent(filePath)
+	flag.Parse()
+	fileContent, err := readFileContent(*filePath)
 
 	if err != nil {
 		fmt.Print(err)
@@ -38,24 +40,25 @@ func main() {
 
 	chapters := splitIntoChapters(fileContent)
 
-	ch := make(chan result)
+	jobs := make(chan int, len(chapters))
+	apiTasks := make(chan result, len(chapters))
 
-	client := openai.NewClient("")
+	client := openai.NewClient(*apiKey)
 
-	for idx, chapter := range chapters {
-		wg.Add(1)
-		go func(idx int, chapter string) {
-			defer wg.Done()
-			callSummary(client, idx+1, chapter, ch)
-		}(idx, chapter)
+	for w := 1; w <= *maxConcurrent; w++ {
+		go callSummary(client, jobs, chapters, apiTasks)
 	}
+
+	for idx := 0; idx < len(chapters); idx++ {
+		jobs <- idx
+	}
+	close(jobs)
 
 	results := make([]result, len(chapters))
 
 	for i := range results {
-		results[i] = <-ch
+		results[i] = <-apiTasks
 	}
-	wg.Wait()
 
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].chapterId < results[j].chapterId
@@ -100,35 +103,37 @@ func removeBlankLines(text string) string {
 	return blankLinePattern.ReplaceAllString(text, "")
 }
 
-func callSummary(client *openai.Client, chapId int, chapterContent string, ch chan<- result) {
-	resp, err := client.CreateChatCompletion(context.Background(),
-		openai.ChatCompletionRequest{
-			Model: openai.GPT3Dot5Turbo,
-			Messages: []openai.ChatCompletionMessage{
-				{
-					Role:    openai.ChatMessageRoleSystem,
-					Content: "Hello. Can you give me summary of each chapter",
+func callSummary(client *openai.Client, jobs <-chan int, chapters []string, resultChan chan<- result) {
+	for chapId := range jobs {
+		resp, err := client.CreateChatCompletion(context.Background(),
+			openai.ChatCompletionRequest{
+				Model: openai.GPT3Dot5Turbo,
+				Messages: []openai.ChatCompletionMessage{
+					{
+						Role:    openai.ChatMessageRoleSystem,
+						Content: "Give me summary of this chapter",
+					},
+					{
+						Role:    openai.ChatMessageRoleUser,
+						Content: chapters[chapId],
+					},
 				},
-				{
-					Role:    openai.ChatMessageRoleUser,
-					Content: chapterContent,
-				},
-			},
-		})
-	if err != nil {
-		fmt.Printf("ChatCompletion error: %v\n", err)
-		ch <- result{
-			chapterId: chapId,
-			data:      "Cant summary this chapter",
-			error:     err,
+			})
+		if err != nil {
+			fmt.Printf("ChatCompletion error: %v\n", err)
+			resultChan <- result{
+				chapterId: chapId,
+				data:      "Cant summary this chapter",
+				error:     err,
+			}
+			return
 		}
-		return
-	}
 
-	ch <- result{
-		chapterId: chapId,
-		data:      resp.Choices[0].Message.Content,
-		error:     nil,
+		resultChan <- result{
+			chapterId: chapId,
+			data:      resp.Choices[0].Message.Content,
+			error:     nil,
+		}
 	}
 
 }
